@@ -6,6 +6,12 @@ import string
 import smtplib
 from email.mime.text import MIMEText
 from twilio.rest import Client
+import os
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -24,15 +30,19 @@ cursor.execute("""
 """)
 conn.commit()
 
-# Twilio (пока заглушки, заменишь позже)
-TWILIO_SID = "your_twilio_sid"
-TWILIO_AUTH_TOKEN = "your_twilio_auth_token"
-TWILIO_PHONE_NUMBER = "your_twilio_phone_number"
-twilio_client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+# Подтягиваем переменные окружения
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# Gmail (пока заглушки, заменишь позже)
-EMAIL_ADDRESS = "your_email@gmail.com"
-EMAIL_PASSWORD = "your_app_password"
+# Проверяем, что переменные подтянулись
+if not all([TWILIO_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, EMAIL_ADDRESS, EMAIL_PASSWORD]):
+    logger.error("One or more environment variables are missing!")
+    raise RuntimeError("Missing environment variables")
+
+twilio_client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
 
 # Модели
 class PhoneAuth(BaseModel):
@@ -55,23 +65,33 @@ def generate_code():
 
 # Отправка SMS
 def send_sms(phone: str, code: str):
-    message = twilio_client.messages.create(
-        body=f"Your code: {code}",
-        from_=TWILIO_PHONE_NUMBER,
-        to=phone
-    )
-    return message.sid
+    try:
+        message = twilio_client.messages.create(
+            body=f"Your code: {code}",
+            from_=TWILIO_PHONE_NUMBER,
+            to=phone
+        )
+        logger.info(f"SMS sent to {phone}: {message.sid}")
+        return message.sid
+    except Exception as e:
+        logger.error(f"Failed to send SMS to {phone}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to send SMS: {str(e)}")
 
 # Отправка email
 def send_email(email: str, code: str):
-    msg = MIMEText(f"Your code: {code}")
-    msg['Subject'] = 'Verification Code'
-    msg['From'] = EMAIL_ADDRESS
-    msg['To'] = email
-    with smtplib.SMTP('smtp.gmail.com', 587) as server:
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.send_message(msg)
+    try:
+        msg = MIMEText(f"Your code: {code}")
+        msg['Subject'] = 'Verification Code'
+        msg['From'] = EMAIL_ADDRESS
+        msg['To'] = email
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+        logger.info(f"Email sent to {email}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {email}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 # Эндпоинты
 @app.post("/auth/phone")
@@ -113,6 +133,7 @@ async def auth_email(data: EmailAuth):
                        (data.email, data.password, auth_key))
         conn.commit()
         return {"message": "Code sent to email", "auth_key": auth_key}
+
 @app.get("/")
 async def root():
     return {"message": "Welcome to Acronix Telegram Clone API"}
