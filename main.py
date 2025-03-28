@@ -113,3 +113,6 @@ async def auth_email(data: EmailAuth):
                        (data.email, data.password, auth_key))
         conn.commit()
         return {"message": "Code sent to email", "auth_key": auth_key}
+@app.get("/")
+async def root():
+    return {"message": "Welcome to Acronix Telegram Clone API"}
