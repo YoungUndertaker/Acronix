@@ -3,7 +3,8 @@ from pydantic import BaseModel
 import sqlite3
 import random
 import string
-import requests
+import smtplib
+from email.mime.text import MIMEText
 import os
 import logging
 
@@ -19,7 +20,8 @@ cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        phone TEXT UNIQUE,
+        email TEXT UNIQUE,
+        password TEXT,
         auth_key TEXT,
         is_active INTEGER DEFAULT 1
     )
@@ -27,76 +29,101 @@ cursor.execute("""
 conn.commit()
 
 # Подтягиваем переменные окружения
-SINCH_SERVICE_PLAN_ID = os.getenv("SINCH_SERVICE_PLAN_ID")
-SINCH_API_TOKEN = os.getenv("SINCH_API_TOKEN")
-SINCH_PHONE_NUMBER = os.getenv("SINCH_PHONE_NUMBER")  # Опционально
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-if not all([SINCH_SERVICE_PLAN_ID, SINCH_API_TOKEN]):
+if not all([EMAIL_ADDRESS, EMAIL_PASSWORD]):
     logger.error("One or more environment variables are missing!")
     raise RuntimeError("Missing environment variables")
 
 # Модели
-class PhoneAuth(BaseModel):
-    phone: str
+class UserRegister(BaseModel):
+    email: str
+    password: str
 
-class PhoneCode(BaseModel):
-    phone: str
+class EmailCode(BaseModel):
+    email: str
     code: str
 
-# Хранилище кодов (временное, можно заменить на Redis для масштабируемости)
-phone_codes = {}
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+# Хранилище кодов для верификации
+email_codes = {}
 
 # Генерация кода
 def generate_code():
     return ''.join(random.choices(string.digits, k=6))
 
-# Отправка SMS через Sinch
-def send_sms(phone: str, code: str):
+# Отправка кода через email
+def send_email(email: str, code: str):
     try:
-        url = f"https://sms.api.sinch.com/xms/v1/{SINCH_SERVICE_PLAN_ID}/batches"
-        headers = {
-            "Authorization": f"Bearer {SINCH_API_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "from": SINCH_PHONE_NUMBER if SINCH_PHONE_NUMBER else "Messenger",
-            "to": [phone],
-            "body": f"Your verification code: {code}"
-        }
-        response = requests.post(url, json=payload, headers=headers)
-        if response.status_code == 201:
-            logger.info(f"SMS sent to {phone}: {response.json()['id']}")
-            return response.json()["id"]
-        else:
-            logger.error(f"Failed to send SMS to {phone}: {response.text}")
-            raise HTTPException(status_code=500, detail=f"Failed to send SMS: {response.text}")
+        msg = MIMEText(f"Your verification code for Acronix Messenger: {code}")
+        msg['Subject'] = 'Verification Code'
+        msg['From'] = EMAIL_ADDRESS
+        msg['To'] = email
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+        logger.info(f"Email sent to {email}")
     except Exception as e:
-        logger.error(f"Failed to send SMS to {phone}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to send SMS: {str(e)}")
+        logger.error(f"Failed to send email to {email}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 # Эндпоинты
-@app.post("/auth/phone")
-async def auth_phone(data: PhoneAuth):
+@app.post("/register")
+async def register(data: UserRegister):
+    # Проверяем, есть ли уже такой email
+    cursor.execute("SELECT id FROM users WHERE email = ?", (data.email,))
+    if cursor.fetchone():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Генерируем код для верификации
     code = generate_code()
-    phone_codes[data.phone] = code
-    send_sms(data.phone, code)
-    return {"message": "Code sent to phone"}
+    email_codes[data.email] = code
+    
+    # Отправляем код на email
+    send_email(data.email, code)
+    
+    # Сохраняем email и пароль в базе (но пока без auth_key, ждём верификации)
+    cursor.execute("INSERT INTO users (email, password) VALUES (?, ?)", (data.email, data.password))
+    conn.commit()
+    
+    return {"message": "Code sent to email for verification"}
 
-@app.post("/auth/phone/verify")
-async def verify_phone(data: PhoneCode):
-    if phone_codes.get(data.phone) == data.code:
-        cursor.execute("SELECT id, auth_key FROM users WHERE phone = ?", (data.phone,))
+@app.post("/register/verify")
+async def verify_registration(data: EmailCode):
+    if email_codes.get(data.email) == data.code:
+        # Проверяем, есть ли пользователь
+        cursor.execute("SELECT id FROM users WHERE email = ?", (data.email,))
         user = cursor.fetchone()
         if not user:
-            auth_key = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
-            cursor.execute("INSERT INTO users (phone, auth_key) VALUES (?, ?)", (data.phone, auth_key))
-            conn.commit()
-        else:
-            auth_key = user[1]
-        del phone_codes[data.phone]
+            raise HTTPException(status_code=400, detail="User not found")
+        
+        # Генерируем auth_key после успешной верификации
+        auth_key = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+        cursor.execute("UPDATE users SET auth_key = ? WHERE email = ?", (auth_key, data.email))
+        conn.commit()
+        
+        # Удаляем код из временного хранилища
+        del email_codes[data.email]
         return {"auth_key": auth_key}
     raise HTTPException(status_code=400, detail="Invalid code")
 
+@app.post("/login")
+async def login(data: UserLogin):
+    cursor.execute("SELECT auth_key, password FROM users WHERE email = ?", (data.email,))
+    user = cursor.fetchone()
+    if not user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if user[1] != data.password:
+        raise HTTPException(status_code=400, detail="Invalid password")
+    if not user[0]:  # Проверяем, есть ли auth_key (то есть прошла ли верификация)
+        raise HTTPException(status_code=400, detail="Email not verified")
+    return {"auth_key": user[0]}
+
 @app.get("/")
 async def root():
-    return {"message": "Welcome to Independent Messenger API"}
+    return {"message": "Welcome to Acronix Messenger API"}
